@@ -20,19 +20,20 @@ This is a known macOS BLE stack issue. Apple has not fixed it for third-party BL
 
 ## What btresumed does
 
-A small native daemon that watches connected BLE peripherals via CoreBluetooth and **automates the exact manual toggle** — but only when needed:
+A small native daemon that automates the exact manual toggle — but only when needed. **Dual-layer detection** for reliability:
 
-1. Peripheral disconnects → wait **5 seconds** (natural reconnect window)
-2. Still disconnected? Is it a **HID-type device** (mouse/keyboard)? Is Bluetooth still powered on by the user?
-3. If all yes: call `IOBluetoothPreferenceSetControllerPowerState(0)` then `(1)` — the same private SPI that the System Settings BT toggle uses
-4. Device reconnects automatically
+1. **CoreBluetooth event layer (happy path)**: watches adopted BLE peripherals via CBCentralManager. On disconnect → wait 5 s (natural reconnect window) → if still disconnected & it's a HID device & BT is still user-on → toggle.
+2. **Log-stream watchdog (broken path)**: CoreBluetooth sometimes stops delivering state events when a peripheral is stuck in the 762 loop. A subprocess tails `/usr/bin/log stream` for `bluetoothd` errors matching the bug signature and triggers toggle in **<1 s**. Zero idle cost (pipe blocks).
+
+The toggle itself is `IOBluetoothPreferenceSetControllerPowerState(0) → (1)` — identical private SPI the System Settings toggle uses. But the SPI is asynchronous: a fixed `sleep` between off/on causes the stack to coalesce them into a no-op. Implementation uses the [blueutil](https://github.com/toy/blueutil) canonical pattern: poll the getter, enforce a minimum off-phase duration, settle, then power on. Off-phase duration grows progressively (3 s → 5 s → 8 s) on consecutive failed attempts; resets on HID reconnect.
 
 Design principles:
 
-- **Event-driven, not timer-driven**: reacts to actual BLE disconnect/connect events, not to wake notifications. Rapid lid-close/open cycles, short sleeps, etc., don't cause unnecessary toggles.
-- **No shell scripts, no third-party dependencies**: pure native Objective-C using only Apple system frameworks.
+- **Event-driven primary, watchdog backup**: reacts to real BLE disconnect/connect events; falls back to bluetoothd log signature when CB is silent. Rapid lid-close/open cycles, short sleeps, etc., don't cause unnecessary toggles.
+- **No shell scripts, no third-party dependencies**: pure native Objective-C using only Apple system frameworks (including `/usr/bin/log` via NSTask).
 - **Preserves pairing keys**: uses only the power-toggle SPI. Pairing records untouched — safe for dual-boot / multi-boot systems where the same pairing keys are shared across OSes.
 - **Respects user intent**: if the user manually disables Bluetooth, the daemon does nothing.
+- **Linux/Windows reconnect latency parity**: typical recovery ≤ 5 s from symptom to working mouse.
 
 ## Is this for you?
 
@@ -106,23 +107,29 @@ classified HID-like: ... (Modern Mobile Mouse)
 
 ```
 ┌─────────────────┐       ┌──────────────────┐      ┌─────────────────────────┐
-│ CBCentralManager│──────▶│ BTResumed daemon │─────▶│ IOBluetoothPreference   │
+│ CBCentralManager│──────▶│                  │─────▶│ IOBluetoothPreference   │
 │  (BLE events)   │       │                  │      │ SetControllerPowerState │
-└─────────────────┘       │  • classify HID  │      │  (System Settings' SPI) │
-                          │  • debounce      │      └─────────────────────────┘
-                          │  • pending check │
+├─────────────────┤       │  BTResumed       │      │  (System Settings' SPI) │
+│ /usr/bin/log    │──────▶│                  │      └─────────────────────────┘
+│  stream (762)   │       │  • classify HID  │
+└─────────────────┘       │  • debounce      │
+   watchdog NSTask        │  • poll + settle │
+                          │  • progressive   │
+                          │    off-phase     │
                           └──────────────────┘
 ```
 
 Key implementation details:
 
-- **Discovery**: `retrieveConnectedPeripheralsWithServices:` with GAP (0x1800) to enumerate all currently connected BLE peripherals (GAP is mandatory on every BLE device).
+- **Discovery**: `retrieveConnectedPeripheralsWithServices:` with GAP (0x1800) to enumerate all currently connected BLE peripherals (GAP is mandatory on every BLE device). Newly paired devices are picked up via 60 s periodic rescan.
+- **Persistent tracking**: HID peripheral UUIDs persist to `~/Library/Application Support/btresumed/hids.plist`. On CB power-on, `retrievePeripheralsWithIdentifiers:` restores tracking even for peripherals not currently connected. Apple canonical pattern for cross-session observation.
 - **HID classification**: Apple's CoreBluetooth hides the standard HID service (0x1812) from third-party CB clients for privacy. The daemon falls back to a **peripheral name heuristic** (matches keywords: `mouse`, `keyboard`, `trackpad`, `magic`, `mx`, `k380`, …). Adjust `nameLooksLikeHID()` in the source if your device has an unusual name.
-- **Disconnect handling**: `didDisconnectPeripheral:` sets a timestamp ticket in `_pending[peripheral.identifier]`. A `dispatch_after` 5s later checks if the peripheral reconnected (ticket cleared by `didConnectPeripheral:`) — if not, evaluate and toggle.
-- **Debounce**: 10-second minimum gap between toggles prevents loops if a peripheral is truly dead (e.g., dead battery).
+- **Log-stream watchdog**: subprocess runs `log stream --predicate 'process == "bluetoothd" AND eventMessage CONTAINS "reason 762"'`. When a matching log line appears, triggers toggle within milliseconds. Auto-restarts if the subprocess exits.
+- **Toggle (poll + progressive off-phase)**: `SetPowerState(0)` → poll `GetPowerState()` until 0 → **enforce minimum off-phase duration** → `SetPowerState(1)` → poll until 1. Off-phase minimum starts at 3 s, grows to 5 s then 8 s on consecutive failed attempts (counter resets on HID reconnect or 60 s idle). This is the [blueutil-canonical](https://github.com/toy/blueutil) poll pattern — a fixed sleep causes the SPI pair to coalesce into a no-op.
+- **Disconnect handling**: `didDisconnectPeripheral:` sets a timestamp ticket. A `dispatch_after` 5 s later checks if the peripheral reconnected (ticket cleared by `didConnectPeripheral:`) — if not, evaluate and toggle.
+- **Debounce**: 5-second minimum gap between toggles prevents loops; 60 s idle resets the consecutive-attempt counter.
 - **BT power intent**: if the user has BT off (`IOBluetoothPreferenceGetControllerPowerState() == 0`), the daemon stays silent.
 - **PoweredOff→PoweredOn transitions**: clears stale pending checks (they're artifacts of BT being toggled off, not real failures).
-- **Periodic rescan**: every 60 seconds, re-query `retrieveConnectedPeripheralsWithServices:` to adopt newly paired devices without requiring a daemon restart.
 
 ## Logs
 

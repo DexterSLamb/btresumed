@@ -20,19 +20,20 @@
 
 ## btresumed 做什么
 
-一个小型原生守护进程，通过 CoreBluetooth 监听 BLE 外设状态，**自动化上述手动 toggle**——但仅在真正需要时才动作：
+一个小型原生守护进程，自动化手动 toggle——但仅在真正需要时才动作。**双层检测**保证可靠：
 
-1. 外设断开 → 等 **5 秒**（给 macOS 自行重连的机会）
-2. 还没重连？是 **HID 类型设备**（鼠标/键盘）吗？蓝牙还是开着的吗？
-3. 全部满足：调用 `IOBluetoothPreferenceSetControllerPowerState(0)` 再 `(1)`——和 System Settings 里蓝牙开关走的是**同一个**私有 SPI
-4. 设备自动重连
+1. **CoreBluetooth 事件层（正常路径）**：通过 CBCentralManager 监听已 adopt 的 BLE 外设。收到断开事件 → 等 5 秒（给 macOS 自愈机会）→ 仍断 & 是 HID & 用户没关蓝牙 → toggle。
+2. **Log stream watchdog（异常路径）**：某些情况下 CoreBluetooth 对卡在 762 loop 的外设**不给我们派发事件**。子进程用 `/usr/bin/log stream` 直接看 `bluetoothd` 的 762 错误日志，一出现立即 toggle，**<1 秒反应**。空闲零耗能（管道阻塞）。
+
+Toggle 本身是 `IOBluetoothPreferenceSetControllerPowerState(0) → (1)`——和系统设置里蓝牙开关走的同一个私有 SPI。但这个 SPI 是**异步**的：固定 sleep 会让 off/on 被 stack 合并为 no-op。实现用 [blueutil](https://github.com/toy/blueutil) 的 canonical 模式：轮询 getter、强制最小 off-phase 时长、settle、再上电。连续失败时 off-phase 递进变长（3 秒 → 5 秒 → 8 秒）；HID 重连时计数归零。
 
 设计原则：
 
-- **事件驱动，不是定时驱动**：响应真实 BLE 断连/连接事件，不响应睡眠/唤醒信号。频繁合盖/开盖、短时睡眠不会触发不必要的 toggle。
-- **无 shell 脚本，无第三方依赖**：纯原生 Objective-C，仅用 Apple 系统 framework。
+- **事件驱动为主，watchdog 兜底**：响应真实 BLE 断连/连接事件；当 CB 失聪时用 bluetoothd 日志签名兜底。频繁合盖/开盖、短时睡眠不会触发不必要的 toggle。
+- **无 shell 脚本，无第三方依赖**：纯原生 Objective-C，只用 Apple 系统 framework（包括通过 NSTask 调用 `/usr/bin/log`）。
 - **保留配对信息**：只调电源 toggle SPI。配对 key 不受影响——双系统/多系统共享配对 key 的场景完全安全。
 - **尊重用户意图**：如果用户主动关了蓝牙，守护进程什么都不做。
+- **和 Linux/Windows 的重连速度持平**：典型恢复 ≤ 5 秒，从鼠标不响应到重新可用。
 
 ## 适合你吗？
 
@@ -106,23 +107,28 @@ classified HID-like: ... (Modern Mobile Mouse)
 
 ```
 ┌─────────────────┐       ┌──────────────────┐      ┌─────────────────────────┐
-│ CBCentralManager│──────▶│ BTResumed daemon │─────▶│ IOBluetoothPreference   │
+│ CBCentralManager│──────▶│                  │─────▶│ IOBluetoothPreference   │
 │  (BLE 事件)     │       │                  │      │ SetControllerPowerState │
-└─────────────────┘       │  • HID 分类      │      │  (Settings 的私有 SPI)  │
-                          │  • 防抖          │      └─────────────────────────┘
-                          │  • 待检 ticket   │
+├─────────────────┤       │  BTResumed       │      │  (Settings 的私有 SPI)  │
+│ /usr/bin/log    │──────▶│                  │      └─────────────────────────┘
+│  stream (762)   │       │  • HID 分类       │
+└─────────────────┘       │  • 防抖           │
+  watchdog NSTask         │  • poll + settle  │
+                          │  • 渐进 off-phase │
                           └──────────────────┘
 ```
 
 核心实现要点：
 
-- **设备发现**：用 `retrieveConnectedPeripheralsWithServices:` + GAP (0x1800) 枚举当前已连接的所有 BLE 外设（GAP 是每个 BLE 设备的强制服务）。
+- **设备发现**：用 `retrieveConnectedPeripheralsWithServices:` + GAP (0x1800) 枚举当前已连接的所有 BLE 外设（GAP 是每个 BLE 设备的强制服务）。新配对的设备通过 60 秒定期 rescan 发现。
+- **持久化追踪**：已分类为 HID 的 peripheral UUID 写入 `~/Library/Application Support/btresumed/hids.plist`。CB PoweredOn 时通过 `retrievePeripheralsWithIdentifiers:` 恢复追踪——**即使 peripheral 当前没连**也能拿回 CBPeripheral 对象。Apple 官方推荐的跨会话观察模式。
 - **HID 识别**：Apple 的 CoreBluetooth **对第三方 CB 客户端隐藏了标准 HID 服务（0x1812）**，出于隐私考虑。所以守护进程退回到 **设备名关键字匹配**（`mouse`, `keyboard`, `trackpad`, `magic`, `mx`, `k380` 等）。如果你的设备名很特别，修改源码里的 `nameLooksLikeHID()` 加上对应关键字即可。
+- **Log-stream watchdog**：子进程跑 `log stream --predicate 'process == "bluetoothd" AND eventMessage CONTAINS "reason 762"'`。一匹配到对应日志行就立即 toggle，毫秒级反应。子进程意外退出会自动重启。
+- **Toggle（poll + 渐进 off-phase）**：`SetPowerState(0)` → 轮询 `GetPowerState()` 直到报 0 → **强制最小 off-phase 时长** → `SetPowerState(1)` → 轮询直到报 1。Off-phase 最小从 3 秒起，连续失败时递增到 5 秒、8 秒（HID 重连或 60 秒空闲时计数归零）。这是 [blueutil 的 canonical 模式](https://github.com/toy/blueutil)——固定 sleep 会让 SPI 的 off/on 被 stack 合并为 no-op。
 - **断连处理**：`didDisconnectPeripheral:` 在 `_pending[peripheral.identifier]` 存一个时间戳 ticket。5 秒后 `dispatch_after` 检查 peripheral 是否已重连（重连时 `didConnectPeripheral:` 会清掉 ticket）——如果没重连就 evaluate → toggle。
-- **防抖**：两次 toggle 之间至少 10 秒。防止死鼠标（比如没电）导致的 toggle 循环。
+- **防抖**：两次 toggle 之间至少 5 秒；60 秒空闲后重置连续失败计数。
 - **尊重用户电源意图**：如果用户主动关了蓝牙（`IOBluetoothPreferenceGetControllerPowerState() == 0`），守护进程保持静默。
 - **PoweredOff→PoweredOn 转换**：清除 stale pending 检查（它们是蓝牙被 toggle 关掉时产生的"假故障"，不是真问题）。
-- **定期 rescan**：每 60 秒重新 `retrieveConnectedPeripheralsWithServices:` 一次，自动 adopt 新配对的设备，无需重启守护进程。
 
 ## 日志
 

@@ -27,6 +27,8 @@ A small native daemon that automates the exact manual toggle — but only when n
 
 The toggle itself is `IOBluetoothPreferenceSetControllerPowerState(0) → (1)` — identical private SPI the System Settings toggle uses. But the SPI is asynchronous: a fixed `sleep` between off/on causes the stack to coalesce them into a no-op. Implementation uses the [blueutil](https://github.com/toy/blueutil) canonical pattern: poll the getter, enforce a minimum off-phase duration, settle, then power on. Off-phase duration grows progressively (3 s → 5 s → 8 s) on consecutive failed attempts; resets on HID reconnect.
 
+**Sleep coordination**: the toggle creates an `IOPMAssertion` (`PreventUserIdleSystemSleep`) for 60 s around its work, and observes `IORegisterForSystemPower` notifications. This prevents a real race observed in v1.2: idle sleep firing within ~23 s after a toggle, catching the Intel CNVi (WiFi+BT combo chip) mid re-initialization, causing Hackintosh firmware EFI-resume hangs. The assertion + sleep observer combo is the same pattern documented for `Transmission`-class apps that must finish in-flight work before sleep.
+
 Design principles:
 
 - **Event-driven primary, watchdog backup**: reacts to real BLE disconnect/connect events; falls back to bluetoothd log signature when CB is silent. Rapid lid-close/open cycles, short sleeps, etc., don't cause unnecessary toggles.

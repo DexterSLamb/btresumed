@@ -27,6 +27,8 @@
 
 Toggle 本身是 `IOBluetoothPreferenceSetControllerPowerState(0) → (1)`——和系统设置里蓝牙开关走的同一个私有 SPI。但这个 SPI 是**异步**的：固定 sleep 会让 off/on 被 stack 合并为 no-op。实现用 [blueutil](https://github.com/toy/blueutil) 的 canonical 模式：轮询 getter、强制最小 off-phase 时长、settle、再上电。连续失败时 off-phase 递进变长（3 秒 → 5 秒 → 8 秒）；HID 重连时计数归零。
 
+**Sleep 协作**：toggle 期间持有 `IOPMAssertion`（`PreventUserIdleSystemSleep`）60 秒，并订阅 `IORegisterForSystemPower` 通知。这解决了 v1.2 观察到的真实 race：toggle 结束后 ~23 秒内发生的 Idle Sleep 会在 Intel CNVi（WiFi+BT 合一芯片）重新初始化中途打断它，导致 Hackintosh 固件 EFI resume hang。assertion + sleep observer 组合是 Apple 文档里给 Transmission 等需要"sleep 前完成 in-flight 操作"app 的标准做法。
+
 设计原则：
 
 - **事件驱动为主，watchdog 兜底**：响应真实 BLE 断连/连接事件；当 CB 失聪时用 bluetoothd 日志签名兜底。频繁合盖/开盖、短时睡眠不会触发不必要的 toggle。

@@ -39,6 +39,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <IOBluetooth/IOBluetooth.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
 #import <unistd.h>
 #import <signal.h>
 #import <fcntl.h>
@@ -64,6 +66,13 @@ static const NSTimeInterval kLogRelaunchDelay = 5.0;   /* if log stream dies */
  * min(_consecutiveToggles, count-1). */
 static const NSTimeInterval kOffPhaseMinByStage[] = {3.0, 5.0, 8.0};
 static const int            kOffPhaseStageCount   = 3;
+
+/* IOPMAssertion timeout — hold PreventUserIdleSystemSleep across toggle +
+ * CNVi-settling window. Empirically, Idle Sleep entering within ~23s after
+ * a toggle catches the stack mid re-init and triggers EFI resume failure
+ * (Bug B signature). 60s gives ample post-toggle quiescence; auto-releases
+ * on timeout so a daemon crash leaks at most one assertion. */
+static const CFTimeInterval kSleepAssertionTimeout = 60.0;
 
 /* Forward decl for the main's cleanup path. */
 @class BTResumed;
@@ -127,6 +136,13 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     /* Log watchdog */
     NSTask                                        *_logTask;
     NSMutableData                                 *_logLineBuf;
+
+    /* Sleep coordination */
+    IOPMAssertionID                                _sleepAssertion;  /* held during toggle + settle */
+    io_connect_t                                   _pmRootPort;      /* for IORegisterForSystemPower */
+    IONotificationPortRef                          _pmNotifyPort;
+    io_object_t                                    _pmNotifier;
+    BOOL                                           _sleepImminent;   /* set in willSleep, cleared on wake */
 }
 
 - (instancetype)init {
@@ -141,6 +157,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         _fmt.locale      = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         _lastCBState     = CBManagerStateUnknown;
         _logLineBuf      = [NSMutableData data];
+        _sleepAssertion  = kIOPMNullAssertionID;
     }
     return self;
 }
@@ -188,11 +205,105 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     [self log:@"CBCentralManager created, waiting for state update..."];
     [self scheduleNextRescan];
     [self startLogWatchdog];
+    [self registerForSystemPowerNotifications];
+}
+
+#pragma mark - Sleep coordination
+
+/* IORegisterForSystemPower C-callback. refCon is (__bridge) BTResumed*. */
+static void btresumed_pm_callback(void *refCon,
+                                   io_service_t service,
+                                   natural_t messageType,
+                                   void *messageArgument) {
+    (void)service;
+    BTResumed *s = (__bridge BTResumed *)refCon;
+    switch (messageType) {
+        case kIOMessageCanSystemSleep:
+            /* Allow sleep — we don't veto, just want to know it's coming. */
+            IOAllowPowerChange(s->_pmRootPort, (long)messageArgument);
+            break;
+        case kIOMessageSystemWillSleep:
+            [s handleSystemWillSleep];
+            IOAllowPowerChange(s->_pmRootPort, (long)messageArgument);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            [s handleSystemDidWake];
+            break;
+        default:
+            break;
+    }
+}
+
+- (void)registerForSystemPowerNotifications {
+    _pmRootPort = IORegisterForSystemPower((__bridge void *)self,
+                                           &_pmNotifyPort,
+                                           btresumed_pm_callback,
+                                           &_pmNotifier);
+    if (_pmRootPort == MACH_PORT_NULL) {
+        [self log:@"WARNING: IORegisterForSystemPower failed; sleep coordination disabled"];
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                       IONotificationPortGetRunLoopSource(_pmNotifyPort),
+                       kCFRunLoopCommonModes);
+    [self log:@"registered for system power notifications"];
+}
+
+- (void)handleSystemWillSleep {
+    [self log:@"system-will-sleep — suppressing new toggles, releasing sleep assertion"];
+    _sleepImminent = YES;
+    [self releaseSleepAssertion];
+}
+
+- (void)handleSystemDidWake {
+    [self log:@"system-has-powered-on — new toggles allowed"];
+    _sleepImminent = NO;
+}
+
+/* Create (or refresh) a PreventUserIdleSystemSleep assertion. The timeout
+ * ensures we self-release if the daemon crashes mid-toggle. Creating a new
+ * assertion when one already exists simply extends the window. */
+- (void)createSleepAssertion {
+    /* Release any prior assertion — a newer toggle restarts the settling clock. */
+    [self releaseSleepAssertion];
+    CFStringRef name   = CFSTR("com.user.btresumed");
+    CFStringRef reason = CFSTR("BT toggle + CNVi settling window");
+    IOReturn r = IOPMAssertionCreateWithDescription(
+        kIOPMAssertionTypePreventUserIdleSystemSleep,
+        name, reason,
+        NULL, NULL,
+        kSleepAssertionTimeout,
+        kIOPMAssertionTimeoutActionRelease,
+        &_sleepAssertion);
+    if (r != kIOReturnSuccess) {
+        [self log:[NSString stringWithFormat:@"IOPMAssertionCreate failed (0x%x)", r]];
+        _sleepAssertion = kIOPMNullAssertionID;
+    }
+}
+
+- (void)releaseSleepAssertion {
+    if (_sleepAssertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(_sleepAssertion);
+        _sleepAssertion = kIOPMNullAssertionID;
+    }
 }
 
 - (void)shutdown {
     if (_logTask && _logTask.isRunning) {
         [_logTask terminate];
+    }
+    [self releaseSleepAssertion];
+    if (_pmNotifier) {
+        IODeregisterForSystemPower(&_pmNotifier);
+        _pmNotifier = 0;
+    }
+    if (_pmNotifyPort) {
+        IONotificationPortDestroy(_pmNotifyPort);
+        _pmNotifyPort = NULL;
+    }
+    if (_pmRootPort) {
+        IOServiceClose(_pmRootPort);
+        _pmRootPort = MACH_PORT_NULL;
     }
 }
 
@@ -341,7 +452,9 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
 
 - (void)handleLogChunk:(NSData *)chunk {
     [_logLineBuf appendData:chunk];
-    NSData *nl = [NSData dataWithBytes:"\n" length:1];
+    static NSData *nl = nil;
+    static dispatch_once_t nlOnce;
+    dispatch_once(&nlOnce, ^{ nl = [NSData dataWithBytes:"\n" length:1]; });
     while (YES) {
         NSRange sr = NSMakeRange(0, _logLineBuf.length);
         NSRange nlRange = [_logLineBuf rangeOfData:nl options:0 range:sr];
@@ -366,6 +479,14 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     /* Respect user intent — if BT was manually turned off, don't touch it. */
     if (IOBluetoothPreferenceGetControllerPowerState() == 0) return;
 
+    /* Don't toggle near sleep entry — started in v1.3 after observing that
+     * Idle Sleep within ~23s of toggle catches CNVi mid re-init and causes
+     * EFI resume failure. */
+    if (_sleepImminent) {
+        [self log:@"watchdog: 762 seen but system is sleeping — skipping toggle"];
+        return;
+    }
+
     NSTimeInterval sinceLast = -[_lastToggle timeIntervalSinceNow];
     if (sinceLast < kToggleDebounce) {
         /* Silent on bursts; bluetoothd often logs 762 many times per second in
@@ -378,7 +499,25 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
 
 #pragma mark - Toggle
 
+/* Note: performToggle blocks the main queue for up to ~26s worst case
+ * (stage-2 off-phase 8s + polls + set(1) + on-polls). This is under macOS's
+ * ~30s willSleep-ack timeout, so even if willSleep fires mid-toggle (queued
+ * on main queue, can't run until toggle returns), we still ack in time.
+ * IOPMAssertion prevents *idle* sleep from firing at all during toggle+
+ * settling, which is the main concern. */
 - (void)performToggle {
+    /* Double-check sleep state — a sleep notification may have arrived
+     * between the caller's check and now. */
+    if (_sleepImminent) {
+        [self log:@"performToggle aborted: sleep imminent"];
+        return;
+    }
+
+    /* Hold a PreventUserIdleSystemSleep assertion for the toggle + settling
+     * window. This is the root fix for the Idle-Sleep-during-CNVi-settling
+     * race that triggered EFI resume hangs. Auto-releases after timeout. */
+    [self createSleepAssertion];
+
     /* Reset consecutive-attempt counter if enough time has passed since last
      * toggle — the current trigger is a fresh issue, not a retry. */
     if (-[_lastToggle timeIntervalSinceNow] > kToggleResetAfter) {
@@ -388,7 +527,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     NSTimeInterval minOffPhase = kOffPhaseMinByStage[stage];
 
     [self log:[NSString stringWithFormat:
-               @"toggle: set(0)  (attempt #%d, min off-phase %.1fs)",
+               @"toggle: set(0)  (attempt #%d, min off-phase %.1fs, sleep-assertion held)",
                _consecutiveToggles + 1, minOffPhase]];
 
     NSDate *offStart = [NSDate date];
@@ -412,6 +551,19 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         [self log:[NSString stringWithFormat:@"toggle: enforcing min off-phase, sleeping %.2fs more",
                    extraUs / 1e6]];
         usleep(extraUs);
+    }
+
+    /* Bug #1 guard: if BT power state is no longer 0 (e.g., user manually toggled
+     * BT on from Settings during our settling window), respect their intent and
+     * don't re-issue set(1). Also abort if they turned it on — they're driving. */
+    int preOnState = IOBluetoothPreferenceGetControllerPowerState();
+    if (preOnState != 0) {
+        [self log:[NSString stringWithFormat:
+                   @"toggle: BT state changed externally to %d during settle, skipping set(1)",
+                   preOnState]];
+        _lastToggle = [NSDate date];
+        _consecutiveToggles++;
+        return;
     }
 
     [self log:@"toggle: set(1)"];

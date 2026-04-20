@@ -29,7 +29,7 @@ if ! command -v clang >/dev/null 2>&1; then
 fi
 clang -arch "$(uname -m)" -fobjc-arc -O2 -Wall -Wno-deprecated-declarations \
     -o btresumed btresumed.m \
-    -framework Foundation -framework IOBluetooth -framework CoreBluetooth
+    -framework Foundation -framework IOBluetooth -framework CoreBluetooth -framework IOKit
 
 # Restore build artifact ownership to the invoking user so the repo isn't
 # littered with root-owned files (makes later `make clean` or git status clean).

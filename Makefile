@@ -17,7 +17,7 @@ INSTALL_UID  ?= $(shell id -u $(INSTALL_USER) 2>/dev/null)
 
 ARCH     ?= $(shell uname -m)
 CFLAGS   := -arch $(ARCH) -fobjc-arc -O2 -Wall -Wno-deprecated-declarations
-FRAMEWORKS := -framework Foundation -framework IOBluetooth -framework CoreBluetooth
+FRAMEWORKS := -framework Foundation -framework IOBluetooth -framework CoreBluetooth -framework IOKit
 
 .PHONY: all install uninstall clean reload
 

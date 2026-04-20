@@ -12,10 +12,6 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/btresumed.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/btresumed.log</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>

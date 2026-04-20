@@ -41,6 +41,8 @@
 #import <IOBluetooth/IOBluetooth.h>
 #import <unistd.h>
 #import <signal.h>
+#import <fcntl.h>
+#import <sys/stat.h>
 
 /* IOBluetooth SPI — same calls System Settings' toggle uses. */
 extern int IOBluetoothPreferenceSetControllerPowerState(int powerState);
@@ -149,7 +151,35 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     fflush(stderr);
 }
 
+- (void)redirectStderrToPersistentLog {
+    /* /tmp is wiped at macOS boot — unusable for diagnosing crashes that
+     * survive across reboots. Redirect stderr to ~/Library/Logs/btresumed.log
+     * (user-level persistent location, per Apple conventions). */
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *lib = [fm URLForDirectory:NSLibraryDirectory
+                            inDomain:NSUserDomainMask
+                   appropriateForURL:nil
+                              create:YES
+                               error:nil];
+    if (!lib) return;
+    NSURL *logsDir = [lib URLByAppendingPathComponent:@"Logs" isDirectory:YES];
+    [fm createDirectoryAtURL:logsDir
+ withIntermediateDirectories:YES
+                  attributes:nil
+                       error:nil];
+    NSURL *logFile = [logsDir URLByAppendingPathComponent:@"btresumed.log"];
+
+    int fd = open(logFile.path.fileSystemRepresentation,
+                  O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+    /* Line-buffer so each log line hits disk immediately (useful for tail -f). */
+    setlinebuf(stderr);
+}
+
 - (void)start {
+    [self redirectStderrToPersistentLog];
     [self log:[NSString stringWithFormat:@"btresumed starting (pid=%d)", getpid()]];
     _cm = [[CBCentralManager alloc]
               initWithDelegate:self

@@ -55,5 +55,5 @@ fi
 
 echo
 echo "Installed. macOS will prompt '$INSTALL_USER' to allow Bluetooth access — click Allow."
-echo "Logs: /tmp/btresumed.log"
+echo "Logs: ~/Library/Logs/btresumed.log  (survives reboots, unlike /tmp)"
 echo "Verify with: launchctl print gui/$INSTALL_UID/com.user.btresumed"

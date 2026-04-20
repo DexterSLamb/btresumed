@@ -88,7 +88,7 @@ sudo make install
 
 ```bash
 launchctl print gui/$(id -u)/com.user.btresumed
-tail -f /tmp/btresumed.log
+tail -f ~/Library/Logs/btresumed.log
 ```
 
 启动正常的话 log 应该长这样：
@@ -132,7 +132,7 @@ classified HID-like: ... (Modern Mobile Mouse)
 
 ## 日志
 
-所有活动都写到 `/tmp/btresumed.log`：
+所有活动都写到 `~/Library/Logs/btresumed.log`：
 
 ```
 [时间戳] disconnect: <uuid> (Mouse) err=(no error), check in 5s
@@ -152,7 +152,7 @@ classified HID-like: ... (Modern Mobile Mouse)
 
 **守护进程启动了，唤醒时没反应**
 
-看 `/tmp/btresumed.log`。如果出现 `CB state: Unauthorized`——到 System Settings → 隐私与安全性 → 蓝牙 里允许 btresumed。
+看 `~/Library/Logs/btresumed.log`。如果出现 `CB state: Unauthorized`——到 System Settings → 隐私与安全性 → 蓝牙 里允许 btresumed。
 
 **设备被分类为 `non-HID`，但它其实是 HID 设备**
 
@@ -160,7 +160,7 @@ classified HID-like: ... (Modern Mobile Mouse)
 
 **守护进程被 kill 了或者退出了**
 
-`tail -n 50 /tmp/btresumed.log` — 看错误行。`launchctl print gui/$(id -u)/com.user.btresumed` 看运行时状态。
+`tail -n 50 ~/Library/Logs/btresumed.log` — 看错误行。`launchctl print gui/$(id -u)/com.user.btresumed` 看运行时状态。
 
 **Toggle 发出了但鼠标还是不重连**
 

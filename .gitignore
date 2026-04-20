@@ -1,0 +1,4 @@
+btresumed
+*.o
+*.dSYM/
+.DS_Store

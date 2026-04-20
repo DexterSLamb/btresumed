@@ -90,7 +90,7 @@ sudo make install
 
 ```bash
 launchctl print gui/$(id -u)/com.user.btresumed
-tail -f ~/Library/Logs/btresumed.log
+tail -f ~/Library/Logs/btresumed/btresumed.log
 ```
 
 Expected log on healthy startup:
@@ -135,7 +135,7 @@ Key implementation details:
 
 ## Logs
 
-All daemon activity is logged to `~/Library/Logs/btresumed.log`:
+All daemon activity is logged to `~/Library/Logs/btresumed/btresumed.log`:
 
 ```
 [timestamp] disconnect: <uuid> (Mouse) err=(no error), check in 5s
@@ -155,7 +155,7 @@ Or, on natural recovery:
 
 **Daemon started but nothing happens on wake**
 
-Check `~/Library/Logs/btresumed.log`. If you see `CB state: Unauthorized` — grant Bluetooth permission in System Settings → Privacy & Security → Bluetooth.
+Check `~/Library/Logs/btresumed/btresumed.log`. If you see `CB state: Unauthorized` — grant Bluetooth permission in System Settings → Privacy & Security → Bluetooth.
 
 **Peripheral classified `non-HID` but it is a HID device**
 
@@ -163,7 +163,7 @@ The name heuristic didn't match. Edit `nameLooksLikeHID()` in `btresumed.m`, add
 
 **Daemon gets killed or exits**
 
-`tail -n 50 ~/Library/Logs/btresumed.log` — look for error lines. `launchctl print gui/$(id -u)/com.user.btresumed` shows its runtime state.
+`tail -n 50 ~/Library/Logs/btresumed/btresumed.log` — look for error lines. `launchctl print gui/$(id -u)/com.user.btresumed` shows its runtime state.
 
 **Toggle fires but mouse still doesn't reconnect**
 

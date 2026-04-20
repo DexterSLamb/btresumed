@@ -74,6 +74,12 @@ static const int            kOffPhaseStageCount   = 3;
  * on timeout so a daemon crash leaks at most one assertion. */
 static const CFTimeInterval kSleepAssertionTimeout = 60.0;
 
+/* Log rotation (self-managed, mirrors CocoaLumberjack defaults).
+ * Path: ~/Library/Logs/btresumed/btresumed.log (+ .1 .. .5 generations)
+ * Max per-file 1 MB, 5 gens = 5 MB total ceiling. */
+static const off_t kMaxLogBytes = 1 * 1024 * 1024;
+static const int   kMaxLogGen   = 5;
+
 /* Forward decl for the main's cleanup path. */
 @class BTResumed;
 static __weak BTResumed *gShared;
@@ -127,6 +133,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     NSMutableDictionary<NSUUID *, NSDate *>       *_pending;          /* check tickets */
     NSMutableSet<NSUUID *>                        *_hidPeripherals;   /* classified HID-like */
     NSMutableSet<NSUUID *>                        *_loggedNonHID;     /* avoid log spam */
+    NSMutableSet<NSUUID *>                        *_connectedSet;     /* believed-connected; suppresses heartbeat connect logs */
     NSDate                                        *_lastToggle;
     NSDateFormatter                               *_fmt;
     CBManagerState                                 _lastCBState;
@@ -151,6 +158,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         _pending         = [NSMutableDictionary dictionary];
         _hidPeripherals  = [NSMutableSet set];
         _loggedNonHID    = [NSMutableSet set];
+        _connectedSet    = [NSMutableSet set];
         _lastToggle      = [NSDate distantPast];
         _fmt             = [[NSDateFormatter alloc] init];
         _fmt.dateFormat  = @"yyyy-MM-dd HH:mm:ss.SSS";
@@ -162,37 +170,79 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     return self;
 }
 
-- (void)log:(NSString *)msg {
-    NSString *ts = [_fmt stringFromDate:[NSDate date]];
-    fprintf(stderr, "[%s] %s\n", ts.UTF8String, msg.UTF8String);
-    fflush(stderr);
-}
-
-- (void)redirectStderrToPersistentLog {
-    /* /tmp is wiped at macOS boot — unusable for diagnosing crashes that
-     * survive across reboots. Redirect stderr to ~/Library/Logs/btresumed.log
-     * (user-level persistent location, per Apple conventions). */
+- (NSString *)logFilePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSURL *lib = [fm URLForDirectory:NSLibraryDirectory
                             inDomain:NSUserDomainMask
                    appropriateForURL:nil
                               create:YES
                                error:nil];
-    if (!lib) return;
-    NSURL *logsDir = [lib URLByAppendingPathComponent:@"Logs" isDirectory:YES];
+    if (!lib) return nil;
+    NSURL *logsDir = [[lib URLByAppendingPathComponent:@"Logs" isDirectory:YES]
+                            URLByAppendingPathComponent:@"btresumed" isDirectory:YES];
     [fm createDirectoryAtURL:logsDir
  withIntermediateDirectories:YES
                   attributes:nil
                        error:nil];
-    NSURL *logFile = [logsDir URLByAppendingPathComponent:@"btresumed.log"];
+    return [logsDir URLByAppendingPathComponent:@"btresumed.log"].path;
+}
 
-    int fd = open(logFile.path.fileSystemRepresentation,
-                  O_WRONLY | O_APPEND | O_CREAT, 0644);
+- (void)redirectStderrToPersistentLog {
+    /* /tmp is wiped at macOS boot — unusable for diagnosing crashes that
+     * survive across reboots. Redirect stderr to a per-user rotated file in
+     * ~/Library/Logs/btresumed/ (Apple's canonical user-log location; Console.app
+     * auto-indexes this directory). Size bound via self-rotation. */
+    NSString *path = [self logFilePath];
+    if (!path) return;
+    /* O_NOFOLLOW defends against symlink substitution attacks on user-writable paths. */
+    int fd = open(path.fileSystemRepresentation,
+                  O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
     if (fd < 0) return;
     dup2(fd, STDERR_FILENO);
     close(fd);
-    /* Line-buffer so each log line hits disk immediately (useful for tail -f). */
     setlinebuf(stderr);
+}
+
+/* Rotate in place when current log exceeds size threshold.
+ * Algorithm: delete .N (oldest) → move .N-1 → .N → ... → .1 → .2 →
+ * base → .1 → open fresh base. All via rename (atomic), no data loss.
+ * Safe to call before every log line — fstat is ~microsecond. */
+- (void)rotateLogIfNeeded {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) != 0) return;
+    if (st.st_size < kMaxLogBytes) return;
+
+    NSString *base = [self logFilePath];
+    if (!base) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    /* Drop the oldest generation. */
+    NSString *oldest = [base stringByAppendingFormat:@".%d", kMaxLogGen];
+    [fm removeItemAtPath:oldest error:nil];
+    /* Shift .N-1 → .N down to .1 → .2 */
+    for (int i = kMaxLogGen - 1; i >= 1; i--) {
+        NSString *src = [base stringByAppendingFormat:@".%d", i];
+        NSString *dst = [base stringByAppendingFormat:@".%d", i + 1];
+        [fm moveItemAtPath:src toPath:dst error:nil];
+    }
+    /* base → .1 */
+    [fm moveItemAtPath:base toPath:[base stringByAppendingString:@".1"] error:nil];
+    /* Reopen base fresh. Existing stderr fd still points at the renamed inode
+     * (now .1); dup2 a freshly-opened base into it to redirect writes. */
+    int fd = open(base.fileSystemRepresentation,
+                  O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
+    if (fd >= 0) {
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+        setlinebuf(stderr);
+    }
+}
+
+- (void)log:(NSString *)msg {
+    [self rotateLogIfNeeded];
+    NSString *ts = [_fmt stringFromDate:[NSDate date]];
+    fprintf(stderr, "[%s] %s\n", ts.UTF8String, msg.UTF8String);
+    fflush(stderr);
 }
 
 - (void)start {
@@ -666,10 +716,20 @@ static void btresumed_pm_callback(void *refCon,
 
 - (void)centralManager:(CBCentralManager *)central
   didConnectPeripheral:(CBPeripheral *)peripheral {
-    [self log:[NSString stringWithFormat:@"connect: %@ (%@)",
-               peripheral.identifier.UUIDString, peripheral.name ?: @"?"]];
+    /* Suppress heartbeat spam: CB fires didConnectPeripheral on every idempotent
+     * connectPeripheral: call (including the one our 60s rescan issues). Only
+     * log when transitioning from disconnected (or unseen) to connected. */
+    BOOL wasConnected = [_connectedSet containsObject:peripheral.identifier];
+    if (!wasConnected) {
+        [_connectedSet addObject:peripheral.identifier];
+        [self log:[NSString stringWithFormat:@"connect: %@ (%@)",
+                   peripheral.identifier.UUIDString, peripheral.name ?: @"?"]];
+    }
+
     if (_pending[peripheral.identifier]) {
-        [self log:@"  pending check canceled (natural recovery)"];
+        if (!wasConnected) {
+            [self log:@"  pending check canceled (natural recovery)"];
+        }
         [_pending removeObjectForKey:peripheral.identifier];
     }
     if (!_peripherals[peripheral.identifier]) {
@@ -677,9 +737,10 @@ static void btresumed_pm_callback(void *refCon,
     }
     [self classifyPeripheral:peripheral];
 
-    /* If a classified HID reconnects, prior toggle(s) worked — reset the
-     * progressive off-phase counter. Next issue starts fresh at stage 0. */
-    if (_consecutiveToggles > 0 &&
+    /* If a classified HID reconnects (real transition), prior toggle(s) worked
+     * — reset the progressive off-phase counter. Next issue starts fresh. */
+    if (!wasConnected &&
+        _consecutiveToggles > 0 &&
         [_hidPeripherals containsObject:peripheral.identifier]) {
         [self log:[NSString stringWithFormat:
                    @"HID reconnected — resetting consecutive toggle counter (was %d)",
@@ -698,6 +759,7 @@ didFailToConnectPeripheral:(CBPeripheral *)peripheral
 - (void)centralManager:(CBCentralManager *)central
 didDisconnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
+    [_connectedSet removeObject:peripheral.identifier];
     [self classifyPeripheral:peripheral];
 
     NSUUID *key = peripheral.identifier;

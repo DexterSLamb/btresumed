@@ -1,39 +1,34 @@
 /*
- * btresumed — event-driven BLE HID recovery daemon (CoreBluetooth-based)
+ * btresumed — event-driven BLE HID recovery daemon (CoreBluetooth + log watchdog)
  *
  * Problem: macOS's BLE stack sometimes fails to re-encrypt paired LE peripherals.
  * Triggers include S3 resume and the peripheral's own idle-sleep cycle.
- * Symptom: HCI reason 762 / MIC failure 0x3D, repeated connect/disconnect loop.
- * Manual workaround is to toggle Bluetooth off/on. This daemon automates that
- * toggle only when needed, without touching pairing keys (quad-boot safe).
+ * Symptom: HCI reason 762 / MIC failure 0x3D, repeated connect/disconnect loop
+ * (bluetoothd keeps trying; CoreBluetooth does not always deliver these events
+ * to third-party clients). Manual workaround is a Bluetooth toggle. This daemon
+ * automates the toggle only when needed, without touching pairing keys
+ * (quad-boot safe).
  *
- * Why CoreBluetooth: IOBluetoothDevice.pairedDevices on Sonoma+ does not
- * enumerate BLE devices. CBCentralManager is the correct API layer.
+ * Detection is two-pronged:
  *
- * Flow:
- *   1. Create CBCentralManager on main queue.
- *   2. When CM reaches PoweredOn:
- *        a. loadPersistedHIDs  — read known HID UUIDs from disk, use
- *           `retrievePeripheralsWithIdentifiers:` to get CBPeripheral objects
- *           even when they're not currently connected. (Apple's canonical
- *           pattern for reconnection across app/session boundaries.)
- *        b. retrieveConnectedPeripheralsWithServices: — enumerate peripherals
- *           that are connected right now.
- *        c. adoptPeripheral on all of the above — set delegate, add to
- *           strong-ref dict, call `connectPeripheral:` to subscribe to events.
- *   3. On didConnectPeripheral: classify by name heuristic. HID classification
- *      is persisted to disk so it survives daemon restarts and CB power cycles.
- *   4. On didDisconnectPeripheral: schedule a check kRecoveryWindow seconds
- *      later. If peripheral hasn't reconnected and it's a HID device, call
- *      IOBluetoothPreferenceSetControllerPowerState(0)/(1) — identical SPI
- *      path to System Settings' BT toggle.
- *   5. On didConnectPeripheral: cancel the pending check (natural recovery).
- *   6. On any non-PoweredOn → PoweredOn transition: clear pending checks
- *      (BT-off artifacts aren't real stuck states).
- *   7. Periodic rescan every kRescanInterval seconds for newly paired devices.
+ *   1. **Event-driven via CBCentralManager** for the happy path: classify
+ *      peripherals, watch for disconnects that don't recover naturally.
+ *      Fast and precise when CB delivers events.
+ *
+ *   2. **Log watchdog via `/usr/bin/log stream`** for the broken path: when
+ *      CB stays silent but bluetoothd is thrashing with reason 762, we tail
+ *      bluetoothd's unified log with a predicate matching the bug signature.
+ *      Any line through = toggle within <1s. Zero idle cost (pipe blocks).
+ *      This matches Linux/Windows reconnect latency (1-5s) and beats polling
+ *      for both responsiveness and power.
+ *
+ * Toggle itself uses the blueutil-canonical pattern:
+ *   SetPowerState(0) → poll Get*PowerState until 0 → settle 1.5s →
+ *   SetPowerState(1) → poll until 1. The SPI is asynchronous (void return),
+ *   so a fixed usleep is insufficient: the stack coalesces off+on into a
+ *   no-op if issued before the controller actually powers down.
  *
  * State file: ~/Library/Application Support/btresumed/hids.plist
- * (Contains peripheral UUIDs classified as HID. Learned per-host, not portable.)
  *
  * Build:
  *   clang -arch x86_64 -fobjc-arc -O2 -Wall -Wno-deprecated-declarations \
@@ -47,18 +42,34 @@
 #import <unistd.h>
 #import <signal.h>
 
-/* IOBluetooth SPI — same call System Settings toggle uses. */
+/* IOBluetooth SPI — same calls System Settings' toggle uses. */
 extern int IOBluetoothPreferenceSetControllerPowerState(int powerState);
 extern int IOBluetoothPreferenceGetControllerPowerState(void);
 
 /* Tunables */
-static const NSTimeInterval kRecoveryWindow = 5.0;   /* wait before concluding stuck */
-static const NSTimeInterval kToggleDebounce = 10.0;  /* min gap between our toggles */
-static const NSTimeInterval kRescanInterval = 60.0;  /* discover newly-paired devices */
-static const useconds_t     kToggleOffOnGap = 500 * 1000;
+static const NSTimeInterval kRecoveryWindow   = 5.0;   /* wait before concluding stuck */
+static const NSTimeInterval kToggleDebounce   = 5.0;   /* min gap between our toggles (was 10) */
+static const NSTimeInterval kToggleResetAfter = 60.0;  /* consecutive counter reset if toggle was this long ago */
+static const NSTimeInterval kRescanInterval   = 60.0;  /* discover newly-paired devices */
+static const useconds_t     kTogglePollIntvUs = 100 * 1000;   /* 100 ms per poll */
+static const int            kToggleOffMaxPolls = 50;           /* 5 s */
+static const int            kToggleOnMaxPolls  = 100;          /* 10 s */
+static const NSTimeInterval kLogRelaunchDelay = 5.0;   /* if log stream dies */
+
+/* Progressive off-phase duration: empirically the off-poll returns too early
+ * (getter flips to 0 before stack quiesces). Enforce minimum total off-phase
+ * time, increasing on consecutive failed attempts. Stage index is
+ * min(_consecutiveToggles, count-1). */
+static const NSTimeInterval kOffPhaseMinByStage[] = {3.0, 5.0, 8.0};
+static const int            kOffPhaseStageCount   = 3;
+
+/* Forward decl for the main's cleanup path. */
+@class BTResumed;
+static __weak BTResumed *gShared;
 
 @interface BTResumed : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
 - (void)start;
+- (void)shutdown;
 @end
 
 /* Name heuristic — classify by peripheral advertised name. Apple's CoreBluetooth
@@ -108,7 +119,12 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     NSDate                                        *_lastToggle;
     NSDateFormatter                               *_fmt;
     CBManagerState                                 _lastCBState;
-    NSURL                                         *_stateFileURL;     /* cached path */
+    NSURL                                         *_stateFileURL;
+    int                                            _consecutiveToggles;  /* resets on HID reconnect */
+
+    /* Log watchdog */
+    NSTask                                        *_logTask;
+    NSMutableData                                 *_logLineBuf;
 }
 
 - (instancetype)init {
@@ -122,6 +138,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         _fmt.dateFormat  = @"yyyy-MM-dd HH:mm:ss.SSS";
         _fmt.locale      = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         _lastCBState     = CBManagerStateUnknown;
+        _logLineBuf      = [NSMutableData data];
     }
     return self;
 }
@@ -140,6 +157,13 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
                        options:@{CBCentralManagerOptionShowPowerAlertKey: @NO}];
     [self log:@"CBCentralManager created, waiting for state update..."];
     [self scheduleNextRescan];
+    [self startLogWatchdog];
+}
+
+- (void)shutdown {
+    if (_logTask && _logTask.isRunning) {
+        [_logTask terminate];
+    }
 }
 
 #pragma mark - Persistent state
@@ -189,7 +213,7 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     NSURL *url = [self stateFileURL];
     if (!url) return;
     NSData *data = [NSData dataWithContentsOfURL:url];
-    if (!data) return;  /* no persisted state yet, normal first run */
+    if (!data) return;
 
     id plist = [NSPropertyListSerialization propertyListWithData:data
                                                           options:NSPropertyListImmutable
@@ -215,11 +239,6 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     }
     if (uuids.count == 0) return;
 
-    /* Apple CoreBluetooth canonical reconnection pattern: retrievePeripherals
-     * WithIdentifiers returns CBPeripheral objects even if not currently
-     * connected, so we can call connectPeripheral: on them and receive future
-     * state events — even when the peripheral is stuck in a 762 connect/
-     * disconnect loop from its own idle-sleep cycle. */
     NSArray<CBPeripheral *> *peripherals = [_cm retrievePeripheralsWithIdentifiers:uuids];
     [self log:[NSString stringWithFormat:
                @"persist: %lu UUID(s) loaded (restored %lu classification(s)), CB returned %lu peripheral(s)",
@@ -231,7 +250,156 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
     }
 }
 
-#pragma mark - Periodic rescan
+#pragma mark - Log watchdog
+
+- (void)startLogWatchdog {
+    /* Clear any partial line residue from a previous task incarnation. */
+    [_logLineBuf setLength:0];
+
+    _logTask = [[NSTask alloc] init];
+    _logTask.launchPath = @"/usr/bin/log";
+    _logTask.arguments = @[
+        @"stream",
+        @"--predicate", @"process == \"bluetoothd\" AND eventMessage CONTAINS \"reason 762\"",
+        @"--style", @"compact"
+    ];
+    NSPipe *outPipe = [NSPipe pipe];
+    NSPipe *errPipe = [NSPipe pipe];
+    _logTask.standardOutput = outPipe;
+    _logTask.standardError  = errPipe;
+
+    __weak typeof(self) weakSelf = self;
+
+    /* Dispatch chunks back to main queue for serial processing. */
+    outPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *fh) {
+        NSData *chunk = [fh availableData];
+        if (chunk.length == 0) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf handleLogChunk:chunk];
+        });
+    };
+    /* Drain stderr to avoid pipe-full deadlock; we don't act on stderr content. */
+    errPipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *fh) {
+        (void)[fh availableData];
+    };
+
+    _logTask.terminationHandler = ^(NSTask *t) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) s = weakSelf;
+            if (!s) return;
+            [s log:[NSString stringWithFormat:
+                    @"log stream exited (status=%d); relaunching in %.0fs",
+                    t.terminationStatus, kLogRelaunchDelay]];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kLogRelaunchDelay * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf startLogWatchdog];
+            });
+        });
+    };
+
+    NSError *err = nil;
+    if (![_logTask launchAndReturnError:&err]) {
+        [self log:[NSString stringWithFormat:@"log stream launch failed: %@", err]];
+        _logTask = nil;
+        return;
+    }
+    [self log:[NSString stringWithFormat:
+               @"log watchdog started (log pid=%d), predicate: reason 762",
+               _logTask.processIdentifier]];
+}
+
+- (void)handleLogChunk:(NSData *)chunk {
+    [_logLineBuf appendData:chunk];
+    NSData *nl = [NSData dataWithBytes:"\n" length:1];
+    while (YES) {
+        NSRange sr = NSMakeRange(0, _logLineBuf.length);
+        NSRange nlRange = [_logLineBuf rangeOfData:nl options:0 range:sr];
+        if (nlRange.location == NSNotFound) break;
+        NSData *lineData = [_logLineBuf subdataWithRange:NSMakeRange(0, nlRange.location)];
+        [_logLineBuf replaceBytesInRange:NSMakeRange(0, nlRange.location + 1)
+                               withBytes:NULL length:0];
+        NSString *line = [[NSString alloc] initWithData:lineData
+                                                encoding:NSUTF8StringEncoding];
+        if (!line) continue;
+
+        /* Filter out `log`'s own header line, which echoes the predicate text
+         * and therefore matches "bluetoothd" and "762". Real log lines contain
+         * `bluetoothd[<pid>:<tid>]`; the bracket is the reliable discriminator. */
+        if ([line containsString:@"bluetoothd["] && [line containsString:@"762"]) {
+            [self watchdogFiredForLogLine:line];
+        }
+    }
+}
+
+- (void)watchdogFiredForLogLine:(NSString *)line {
+    /* Respect user intent — if BT was manually turned off, don't touch it. */
+    if (IOBluetoothPreferenceGetControllerPowerState() == 0) return;
+
+    NSTimeInterval sinceLast = -[_lastToggle timeIntervalSinceNow];
+    if (sinceLast < kToggleDebounce) {
+        /* Silent on bursts; bluetoothd often logs 762 many times per second in
+         * the stuck state and a single toggle is the right fix. */
+        return;
+    }
+    [self log:@"watchdog: reason 762 detected in bluetoothd log → toggling BT"];
+    [self performToggle];
+}
+
+#pragma mark - Toggle
+
+- (void)performToggle {
+    /* Reset consecutive-attempt counter if enough time has passed since last
+     * toggle — the current trigger is a fresh issue, not a retry. */
+    if (-[_lastToggle timeIntervalSinceNow] > kToggleResetAfter) {
+        _consecutiveToggles = 0;
+    }
+    int stage = MIN(_consecutiveToggles, kOffPhaseStageCount - 1);
+    NSTimeInterval minOffPhase = kOffPhaseMinByStage[stage];
+
+    [self log:[NSString stringWithFormat:
+               @"toggle: set(0)  (attempt #%d, min off-phase %.1fs)",
+               _consecutiveToggles + 1, minOffPhase]];
+
+    NSDate *offStart = [NSDate date];
+    IOBluetoothPreferenceSetControllerPowerState(0);
+
+    int polls = 0;
+    while (polls < kToggleOffMaxPolls &&
+           IOBluetoothPreferenceGetControllerPowerState() != 0) {
+        usleep(kTogglePollIntvUs);
+        polls++;
+    }
+    NSTimeInterval getterElapsed = -[offStart timeIntervalSinceNow];
+    [self log:[NSString stringWithFormat:@"toggle: off-getter returned 0 after %.2fs",
+               getterElapsed]];
+
+    /* The getter can report 0 before the stack has actually quiesced — a false
+     * positive that led to ineffective toggles in practice. Enforce the stage's
+     * minimum off-phase duration regardless of what the getter says. */
+    if (getterElapsed < minOffPhase) {
+        useconds_t extraUs = (useconds_t)((minOffPhase - getterElapsed) * 1e6);
+        [self log:[NSString stringWithFormat:@"toggle: enforcing min off-phase, sleeping %.2fs more",
+                   extraUs / 1e6]];
+        usleep(extraUs);
+    }
+
+    [self log:@"toggle: set(1)"];
+    IOBluetoothPreferenceSetControllerPowerState(1);
+    polls = 0;
+    while (polls < kToggleOnMaxPolls &&
+           IOBluetoothPreferenceGetControllerPowerState() != 1) {
+        usleep(kTogglePollIntvUs);
+        polls++;
+    }
+    [self log:[NSString stringWithFormat:@"toggle: on confirmed after %d poll(s) (%.1fs)",
+               polls, polls * kTogglePollIntvUs / 1e6]];
+
+    _lastToggle = [NSDate date];
+    _consecutiveToggles++;
+}
+
+#pragma mark - Periodic rescan (discover newly paired devices)
 
 - (void)scheduleNextRescan {
     __weak typeof(self) weakSelf = self;
@@ -279,8 +447,6 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
 
     if (central.state != CBManagerStatePoweredOn) return;
 
-    /* Clear stale pending on any non-PoweredOn → PoweredOn transition.
-     * (Unknown is the first-call initial state; nothing to clear then.) */
     if (prev != CBManagerStateUnknown &&
         prev != CBManagerStatePoweredOn &&
         _pending.count > 0) {
@@ -290,10 +456,8 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         [_pending removeAllObjects];
     }
 
-    /* (1) Load persisted HID UUIDs — survives CB power cycles + daemon restarts. */
     [self loadPersistedHIDs];
 
-    /* (2) Discover currently-connected peripherals (new pairings + Classic). */
     NSArray<CBPeripheral *> *connected =
         [central retrieveConnectedPeripheralsWithServices:connectedPeripheralUUIDs()];
     [self log:[NSString stringWithFormat:@"found %lu currently connected BLE peripheral(s)",
@@ -302,8 +466,6 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         [self adoptPeripheral:p];
     }
 
-    /* (3) Re-arm every tracked peripheral so CB resumes delivering state
-     * events for them (connectPeripheral is idempotent). */
     for (CBPeripheral *p in _peripherals.allValues) {
         [central connectPeripheral:p options:nil];
     }
@@ -312,14 +474,11 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
 - (void)adoptPeripheral:(CBPeripheral *)p {
     BOOL isNew = (_peripherals[p.identifier] == nil);
     p.delegate = self;
-    _peripherals[p.identifier] = p;  /* always update ref in case CB handed a newer one */
+    _peripherals[p.identifier] = p;
     if (isNew) {
         [self log:[NSString stringWithFormat:@"adopt: %@ (%@) state=%ld",
                    p.identifier.UUIDString, p.name ?: @"?", (long)p.state]];
     }
-    /* connectPeripheral subscribes us to peripheral state events and, if the
-     * peripheral isn't currently connected, tells CB to keep retrying. Both
-     * behaviors are what we want. */
     [_cm connectPeripheral:p options:nil];
 }
 
@@ -335,6 +494,16 @@ static NSArray<CBUUID *> *connectedPeripheralUUIDs(void) {
         [self adoptPeripheral:peripheral];
     }
     [self classifyPeripheral:peripheral];
+
+    /* If a classified HID reconnects, prior toggle(s) worked — reset the
+     * progressive off-phase counter. Next issue starts fresh at stage 0. */
+    if (_consecutiveToggles > 0 &&
+        [_hidPeripherals containsObject:peripheral.identifier]) {
+        [self log:[NSString stringWithFormat:
+                   @"HID reconnected — resetting consecutive toggle counter (was %d)",
+                   _consecutiveToggles]];
+        _consecutiveToggles = 0;
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)central
@@ -347,7 +516,6 @@ didFailToConnectPeripheral:(CBPeripheral *)peripheral
 - (void)centralManager:(CBCentralManager *)central
 didDisconnectPeripheral:(CBPeripheral *)peripheral
                  error:(NSError *)error {
-    /* Re-classify: peripheral.name may have been nil at first didConnect. */
     [self classifyPeripheral:peripheral];
 
     NSUUID *key = peripheral.identifier;
@@ -374,15 +542,12 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
         [s evaluateAndMaybeToggle:peripheral];
     });
 
-    /* Re-arm CB subscription. */
     [central connectPeripheral:peripheral options:nil];
 }
 
 #pragma mark - Classification
 
 - (void)classifyPeripheral:(CBPeripheral *)peripheral {
-    /* Once classified HID, never downgrade. Non-HID is always re-checkable
-     * because the name may have been nil at first adoption. */
     if ([_hidPeripherals containsObject:peripheral.identifier]) return;
 
     if (nameLooksLikeHID(peripheral.name)) {
@@ -394,7 +559,6 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
         return;
     }
 
-    /* Log non-HID classification only once per peripheral to avoid spam. */
     if (![_loggedNonHID containsObject:peripheral.identifier]) {
         [_loggedNonHID addObject:peripheral.identifier];
         [self log:[NSString stringWithFormat:
@@ -403,10 +567,9 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
     }
 }
 
-#pragma mark - Evaluation
+#pragma mark - CB-driven evaluation
 
 - (void)evaluateAndMaybeToggle:(CBPeripheral *)peripheral {
-    /* Final re-classification — last chance for a late-arriving name. */
     [self classifyPeripheral:peripheral];
 
     if (![_hidPeripherals containsObject:peripheral.identifier]) {
@@ -421,8 +584,7 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
         return;
     }
 
-    int state = IOBluetoothPreferenceGetControllerPowerState();
-    if (state == 0) {
+    if (IOBluetoothPreferenceGetControllerPowerState() == 0) {
         [self log:@"check: BT powered off by user, respect intent"];
         return;
     }
@@ -434,13 +596,9 @@ didDisconnectPeripheral:(CBPeripheral *)peripheral
         return;
     }
 
-    [self log:[NSString stringWithFormat:@"check: %@ still disconnected → toggle BT",
+    [self log:[NSString stringWithFormat:@"check: %@ still disconnected → toggling BT",
                peripheral.name ?: @"?"]];
-    IOBluetoothPreferenceSetControllerPowerState(0);
-    usleep(kToggleOffOnGap);
-    IOBluetoothPreferenceSetControllerPowerState(1);
-    _lastToggle = [NSDate date];
-    [self log:@"toggle complete"];
+    [self performToggle];
 }
 
 @end
@@ -453,14 +611,16 @@ int main(int argc, char *argv[]) {
             dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0,
                                    dispatch_get_main_queue());
         dispatch_source_set_event_handler(sigTerm, ^{
-            fprintf(stderr, "SIGTERM received, exiting\n");
+            fprintf(stderr, "SIGTERM received, cleaning up\n");
             fflush(stderr);
+            [gShared shutdown];
             exit(0);
         });
         dispatch_resume(sigTerm);
         signal(SIGTERM, SIG_IGN);
 
         BTResumed *w = [[BTResumed alloc] init];
+        gShared = w;
         [w start];
 
         [[NSRunLoop currentRunLoop] run];
